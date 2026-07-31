@@ -21,20 +21,19 @@ import (
 )
 
 // TestUnnumberedReconciler_DiscoveryFailureReporting covers the bookkeeping behind the
-// warn-once logging of an unnumbered peer whose address cannot be discovered: the peer is
-// remembered until it either recovers or its instance goes away.
+// warn-once logging of an unnumbered peer that cannot be discovered: the peer is remembered
+// until it either recovers or its instance goes away.
 func TestUnnumberedReconciler_DiscoveryFailureReporting(t *testing.T) {
 	req := require.New(t)
 
 	testInstance := &instance.BGPInstance{Name: "test-instance"}
 
-	setTables := func(r *UnnumberedReconciler, neighbors []*tables.Neighbor) {
-		db, err := setupStateDBWithNeighbors([]*tables.Route{
-			defaultRouteEntry("192.168.0.3", 123, 100),
-		}, neighbors)
+	setTables := func(r *UnnumberedReconciler, routes []*tables.Route) {
+		db, err := setupStateDB(routes)
 		req.NoError(err)
 		txn := db.ReadTxn()
 		r.DB = db
+		r.routeTable = db.GetTable(txn, "routes").(statedb.Table[*tables.Route])
 		r.deviceTable = db.GetTable(txn, "devices").(statedb.Table[*tables.Device])
 		r.neighborTable = db.GetTable(txn, "neighbors").(statedb.Table[*tables.Neighbor])
 	}
@@ -42,7 +41,7 @@ func TestUnnumberedReconciler_DiscoveryFailureReporting(t *testing.T) {
 	reconcile := func(r *UnnumberedReconciler) *v2.CiliumBGPNodeInstance {
 		config := &v2.CiliumBGPNodeInstance{
 			Name:  testInstance.Name,
-			Peers: []v2.CiliumBGPNodePeer{unnumberedPeer("peer-unnum", "eth0")},
+			Peers: []v2.CiliumBGPNodePeer{unnumberedGatewayPeer("peer-unnum", "ipv4")},
 		}
 		req.NoError(r.Reconcile(context.Background(), ReconcileParams{
 			BGPInstance:   testInstance,
@@ -54,27 +53,27 @@ func TestUnnumberedReconciler_DiscoveryFailureReporting(t *testing.T) {
 
 	reconciler := &UnnumberedReconciler{logger: hivetest.Logger(t)}
 
-	// No neighbor on eth0 yet, so the peer's address cannot be discovered. Its
-	// configured interface remains available for the RA sender.
+	// No default route yet, so the peer's interface cannot be derived.
 	setTables(reconciler, nil)
 	config := reconcile(reconciler)
-	req.Equal("eth0", config.Peers[0].AutoDiscovery.Unnumbered.Interface)
-	req.Nil(config.Peers[0].PeerAddress)
+	req.Nil(config.Peers[0].AutoDiscovery.Unnumbered)
 	req.Contains(reconciler.discoveryFailed, "test-instance/peer-unnum")
 
 	// The failure is tracked once, however many rounds it persists for.
 	reconcile(reconciler)
 	req.Len(reconciler.discoveryFailed, 1)
 
-	// The neighbor appears: the peer is configured and no longer tracked.
-	setTables(reconciler, []*tables.Neighbor{peerNeighbor("fe80::1", 123)})
+	// The default route appears: the peer is configured and no longer tracked.
+	setTables(reconciler, []*tables.Route{
+		defaultRouteEntry("192.168.0.3", 123, 100),
+	})
 	config = reconcile(reconciler)
 	req.Equal("eth0", config.Peers[0].AutoDiscovery.Unnumbered.Interface)
 	req.Equal("fe80::1%eth0", ptr.Deref(config.Peers[0].PeerAddress, ""))
 	req.Empty(reconciler.discoveryFailed)
 
-	// The neighbor goes away again, and this time the instance is deleted while
-	// the peer is failing.
+	// The route goes away again, and this time the instance is deleted while the
+	// peer is failing.
 	setTables(reconciler, nil)
 	reconcile(reconciler)
 	req.Len(reconciler.discoveryFailed, 1)
@@ -85,7 +84,7 @@ func TestUnnumberedReconciler_DiscoveryFailureReporting(t *testing.T) {
 
 	// A peer that leaves the configuration stops being watched, so its link no
 	// longer signals a reconciliation on every neighbor change.
-	setTables(reconciler, []*tables.Neighbor{peerNeighbor("fe80::1", 123)})
+	setTables(reconciler, []*tables.Route{defaultRouteEntry("192.168.0.3", 123, 100)})
 	reconcile(reconciler)
 	req.Len(reconciler.unnumberedLinks, 1)
 	req.NoError(reconciler.Reconcile(context.Background(), ReconcileParams{
@@ -101,7 +100,7 @@ func TestUnnumberedReconciler_DiscoveryFailureReporting(t *testing.T) {
 // TestUnnumberedReconciler_UnnumberedPeerAddress covers picking the unnumbered peer's
 // address out of the node's neighbor entries on the peering interface.
 func TestUnnumberedReconciler_UnnumberedPeerAddress(t *testing.T) {
-	// The index of eth0, the peering interface.
+	// eth0, the interface the ipv4 default route below egresses.
 	const linkIndex = 123
 
 	failedNeighbor := peerNeighbor("fe80::dead", linkIndex)
@@ -175,13 +174,16 @@ func TestUnnumberedReconciler_UnnumberedPeerAddress(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			req := require.New(t)
 
-			db, err := setupStateDBWithNeighbors(nil, tt.neighbors)
+			db, err := setupStateDBWithNeighbors([]*tables.Route{
+				defaultRouteEntry("192.168.0.3", linkIndex, 100),
+			}, tt.neighbors)
 			req.NoError(err)
 
 			txn := db.ReadTxn()
 			reconciler := &UnnumberedReconciler{
 				logger:          hivetest.Logger(t),
 				DB:              db,
+				routeTable:      db.GetTable(txn, "routes").(statedb.Table[*tables.Route]),
 				deviceTable:     db.GetTable(txn, "devices").(statedb.Table[*tables.Device]),
 				neighborTable:   db.GetTable(txn, "neighbors").(statedb.Table[*tables.Neighbor]),
 				discoveryFailed: make(map[string]struct{}),
@@ -190,7 +192,7 @@ func TestUnnumberedReconciler_UnnumberedPeerAddress(t *testing.T) {
 
 			config := &v2.CiliumBGPNodeInstance{
 				Name:  "test-instance",
-				Peers: []v2.CiliumBGPNodePeer{unnumberedPeer("peer-unnum", "eth0")},
+				Peers: []v2.CiliumBGPNodePeer{unnumberedGatewayPeer("peer-unnum", "ipv4")},
 			}
 			req.NoError(reconciler.Reconcile(context.Background(), ReconcileParams{
 				BGPInstance:   &instance.BGPInstance{Name: "test-instance"},
@@ -198,9 +200,9 @@ func TestUnnumberedReconciler_UnnumberedPeerAddress(t *testing.T) {
 				CiliumNode:    &v2.CiliumNode{ObjectMeta: metav1.ObjectMeta{Name: "bgp-node"}},
 			}))
 
-			// The interface is set either way: the Router Advertisements the peer
-			// learns this node's own address from depend on it, and they are what
-			// eventually populates the neighbor entry looked for here.
+			// The interface is derived either way: the Router Advertisements the
+			// peer learns this node's own address from depend on it, and they are
+			// what eventually populates the neighbor entry looked for here.
 			req.Equal("eth0", config.Peers[0].AutoDiscovery.Unnumbered.Interface)
 			// And the link is watched either way, so the neighbor appearing later
 			// triggers another round.
@@ -243,6 +245,7 @@ func TestUnnumberedReconciler_UnnumberedIgnoresOwnAddress(t *testing.T) {
 	reconciler := &UnnumberedReconciler{
 		logger:          hivetest.Logger(t),
 		DB:              db,
+		routeTable:      db.GetTable(readTxn, "routes").(statedb.Table[*tables.Route]),
 		deviceTable:     deviceTable,
 		neighborTable:   db.GetTable(readTxn, "neighbors").(statedb.Table[*tables.Neighbor]),
 		discoveryFailed: make(map[string]struct{}),

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"net"
 	"net/netip"
 	"slices"
 	"strings"
@@ -30,7 +31,8 @@ import (
 // DefaultGatewayReconciler is a ConfigReconciler which handles auto-discovery
 // of peer addresses: DefaultGateway mode (from the default route) and
 // Unnumbered mode (the peer's IPv6 link-local address, from the neighbor table,
-// on the configured interface). It runs with the highest priority to ensure peer
+// on an interface that is either configured explicitly or discovered as the one
+// the default route egresses). It runs with the highest priority to ensure peer
 // addresses are populated before other reconcilers run.
 type DefaultGatewayReconciler struct {
 	logger        *slog.Logger
@@ -181,16 +183,32 @@ func (r *DefaultGatewayReconciler) Reconcile(ctx context.Context, p ReconcilePar
 				types.PeerLogField, peer.Name,
 				logfields.Address, defaultGateway)
 		case v2.BGPUnnumberedMode:
-			if peer.AutoDiscovery.Unnumbered == nil {
-				l.Debug("Unnumbered mode set without unnumbered configuration, skipping",
+			// BGP unnumbered: the peer is not configured with an address at all,
+			// it is reached over an interface at whatever IPv6 link-local address
+			// Neighbor Discovery learned for it. Both halves are discovered here:
+			// the interface, and then the peer's address on it.
+			var iface string
+			switch {
+			case peer.AutoDiscovery.Unnumbered != nil:
+				iface = peer.AutoDiscovery.Unnumbered.Interface
+			case peer.AutoDiscovery.DefaultGateway != nil:
+				// Interface names are not portable across a heterogeneous fleet
+				// (they encode hardware location and vary with the driver), so
+				// discover the link facing the peer by following the default route
+				// of the requested address family. Only its egress interface is
+				// used; the peer address comes from ND on that interface.
+				discovered, err := r.getDefaultGatewayInterface(peer.AutoDiscovery.DefaultGateway)
+				if err != nil {
+					r.reportDiscoveryFailure(l, p.DesiredConfig.Name, peer.Name, err)
+					continue
+				}
+				iface = discovered
+			default:
+				// Rejected by the CRD validation rules, be defensive.
+				l.Debug("Unnumbered mode set without unnumbered or defaultGateway configuration, skipping",
 					types.PeerLogField, peer.Name)
 				continue
 			}
-
-			// BGP unnumbered: the peer is not configured with an address at all,
-			// it is reached over an interface at whatever IPv6 link-local address
-			// Neighbor Discovery learned for it.
-			iface := peer.AutoDiscovery.Unnumbered.Interface
 
 			// Set the interface even if the peer address cannot be resolved yet:
 			// the UnnumberedRAReconciler keys the Router Advertisements it sends
@@ -228,28 +246,33 @@ func (r *DefaultGatewayReconciler) Reconcile(ctx context.Context, p ReconcilePar
 	return nil
 }
 
-// getDefaultGateway returns the default gateway address with lower priority using route and device
-// statedb tables and the provided default gateway configuration.
-func (r *DefaultGatewayReconciler) getDefaultGateway(defaultGateway *v2.DefaultGateway) (string, error) {
-	var defaultRoute netip.Prefix
-	switch defaultGateway.AddressFamily {
+// defaultRoute pairs a default route with the device it egresses.
+type defaultRoute struct {
+	route *tables.Route
+	dev   *tables.Device
+}
+
+// activeDefaultRoutes returns the node's default routes for the given address family whose
+// egress device is present in the device table, ordered by ascending priority (metric), so the
+// most preferred route comes first. Filtering on the route's gateway and on the state of the
+// device is left to the caller, as it differs per auto-discovery mode.
+func (r *DefaultGatewayReconciler) activeDefaultRoutes(addressFamily string) ([]defaultRoute, error) {
+	var defaultPrefix netip.Prefix
+	switch addressFamily {
 	case "ipv4":
-		defaultRoute = ipv4Default
+		defaultPrefix = ipv4Default
 	case "ipv6":
-		defaultRoute = ipv6Default
+		defaultPrefix = ipv6Default
 	default:
-		return "", fmt.Errorf("invalid address family %s", defaultGateway.AddressFamily)
+		return nil, fmt.Errorf("invalid address family %s", addressFamily)
 	}
 
 	txn := r.DB.ReadTxn()
 	// get routes from statedb route table
 	// TODO: add RoutePrefixIndex Query to lookup routes by prefix
-	routes := r.routeTable.All(txn)
-	activeDefaultRoutes := []*tables.Route{}
-
-	for route := range routes {
-		// ignore routes that are not default routes or do not have a valid gateway
-		if !route.Gw.IsValid() || route.Dst != defaultRoute {
+	var routes []defaultRoute
+	for route := range r.routeTable.All(txn) {
+		if route.Dst != defaultPrefix {
 			continue
 		}
 		// Only the main table holds the node's default gateway. Other tables
@@ -263,27 +286,72 @@ func (r *DefaultGatewayReconciler) getDefaultGateway(defaultGateway *v2.DefaultG
 			continue
 		}
 		dev, _, found := r.deviceTable.Get(txn, tables.DeviceByIndex(route.LinkIndex))
-		// ignore routes if the link through which it is reachable is not up
-		if !found || dev.OperStatus != "up" {
+		if !found {
 			continue
 		}
-		if route.Gw.IsLinkLocalUnicast() {
+		routes = append(routes, defaultRoute{route: route, dev: dev})
+	}
+
+	slices.SortStableFunc(routes, func(r0, r1 defaultRoute) int {
+		return cmp.Compare(r0.route.Priority, r1.route.Priority)
+	})
+
+	return routes, nil
+}
+
+// getDefaultGateway returns the default gateway address with lower priority using route and device
+// statedb tables and the provided default gateway configuration.
+func (r *DefaultGatewayReconciler) getDefaultGateway(defaultGateway *v2.DefaultGateway) (string, error) {
+	routes, err := r.activeDefaultRoutes(defaultGateway.AddressFamily)
+	if err != nil {
+		return "", err
+	}
+
+	for _, dr := range routes {
+		// ignore routes that do not have a valid gateway
+		if !dr.route.Gw.IsValid() {
+			continue
+		}
+		// ignore routes if the link through which it is reachable is not up
+		if dr.dev.OperStatus != linkOperStateUp {
+			continue
+		}
+		if dr.route.Gw.IsLinkLocalUnicast() {
 			r.logger.Warn("link local address is not supported for default gateway mode of bgp auto-discovery",
-				logfields.Gateway, route.Gw,
+				logfields.Gateway, dr.route.Gw,
 			)
 			continue
 		}
-		activeDefaultRoutes = append(activeDefaultRoutes, route)
+		// routes are ordered by priority, so the first match is the gateway of
+		// the most preferred default route
+		return dr.route.Gw.String(), nil
 	}
 
-	if len(activeDefaultRoutes) == 0 {
-		return "", fmt.Errorf("no active default route found")
+	return "", fmt.Errorf("no active default route found")
+}
+
+// getDefaultGatewayInterface returns the name of the interface which the most preferred default
+// route of the given address family egresses, for use as the interface of an unnumbered peer.
+//
+// Unlike getDefaultGateway, the gateway address itself is irrelevant here: only the route's
+// egress link is taken, and the peer is subsequently reached over it at the IPv6 link-local
+// address ND discovered (see getUnnumberedPeerAddress). Routes with a link-local gateway - the
+// common case towards an unnumbered ToR, e.g. via fe80::1 or via 169.254.100.0 - and on-link
+// default routes with no gateway at all are therefore both usable.
+func (r *DefaultGatewayReconciler) getDefaultGatewayInterface(defaultGateway *v2.DefaultGateway) (string, error) {
+	routes, err := r.activeDefaultRoutes(defaultGateway.AddressFamily)
+	if err != nil {
+		return "", err
 	}
 
-	// return the gateway address with lowest priority
-	return slices.MinFunc(activeDefaultRoutes, func(r0, r1 *tables.Route) int {
-		return cmp.Compare(r0.Priority, r1.Priority)
-	}).Gw.String(), nil
+	for _, dr := range routes {
+		if !deviceUsable(dr.dev) || dr.dev.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		return dr.dev.Name, nil
+	}
+
+	return "", fmt.Errorf("no active default route found for address family %s", defaultGateway.AddressFamily)
 }
 
 // getUnnumberedPeerAddress returns the address of the unnumbered peer reached over ifname:

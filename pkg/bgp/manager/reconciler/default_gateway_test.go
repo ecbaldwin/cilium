@@ -259,6 +259,127 @@ func TestDefaultGatewayReconciler_Reconcile(t *testing.T) {
 			err: nil,
 		},
 		{
+			// Unnumbered mode with defaultGateway: the interface is not named in the
+			// config, it is the one the default route of the requested family egresses.
+			name:             "unnumbered peer derives interface from the ipv4 default route",
+			routes:           defaultRouteTable,
+			peers:            []v2.CiliumBGPNodePeer{unnumberedGatewayPeer("peer-unnum-v4", "ipv4")},
+			expectedPeers:    []v2.CiliumBGPNodePeer{withPeerInterface(unnumberedGatewayPeer("peer-unnum-v4", "ipv4"), "eth0")},
+			newPeers:         []v2.CiliumBGPNodePeer{unnumberedGatewayPeer("peer-unnum-v4", "ipv4")},
+			expectedNewPeers: []v2.CiliumBGPNodePeer{withPeerInterface(unnumberedGatewayPeer("peer-unnum-v4", "ipv4"), "eth0")},
+			err:              nil,
+		},
+		{
+			name:             "unnumbered peer derives interface from the ipv6 default route",
+			routes:           defaultRouteTable,
+			peers:            []v2.CiliumBGPNodePeer{unnumberedGatewayPeer("peer-unnum-v6", "ipv6")},
+			expectedPeers:    []v2.CiliumBGPNodePeer{withPeerInterface(unnumberedGatewayPeer("peer-unnum-v6", "ipv6"), "eth1")},
+			newPeers:         []v2.CiliumBGPNodePeer{unnumberedGatewayPeer("peer-unnum-v6", "ipv6")},
+			expectedNewPeers: []v2.CiliumBGPNodePeer{withPeerInterface(unnumberedGatewayPeer("peer-unnum-v6", "ipv6"), "eth1")},
+			err:              nil,
+		},
+		{
+			// A link-local gateway is the common case towards an unnumbered ToR. Only
+			// the egress interface is taken from the route, so it is usable here -
+			// while DefaultGateway mode, which needs the gateway as a peer address,
+			// still rejects it.
+			name: "unnumbered peer derives interface from a default route with a link-local gateway",
+			routes: []*tables.Route{
+				defaultRouteEntry("fe80::1", 124, 100),
+			},
+			peers: []v2.CiliumBGPNodePeer{
+				unnumberedGatewayPeer("peer-unnum-lla", "ipv6"),
+				gatewayPeer("peer-gw-lla", "ipv6"),
+			},
+			expectedPeers: []v2.CiliumBGPNodePeer{
+				withPeerInterface(unnumberedGatewayPeer("peer-unnum-lla", "ipv6"), "eth1"),
+				gatewayPeer("peer-gw-lla", "ipv6"),
+			},
+			err: nil,
+		},
+		{
+			// An on-link default route (default dev eth1, no gateway) also names the
+			// interface facing the peer.
+			name: "unnumbered peer derives interface from an on-link default route",
+			routes: []*tables.Route{
+				onlinkDefaultRouteEntry("0.0.0.0/0", 124, 100),
+			},
+			peers: []v2.CiliumBGPNodePeer{
+				unnumberedGatewayPeer("peer-unnum-onlink", "ipv4"),
+				gatewayPeer("peer-gw-onlink", "ipv4"),
+			},
+			expectedPeers: []v2.CiliumBGPNodePeer{
+				withPeerInterface(unnumberedGatewayPeer("peer-unnum-onlink", "ipv4"), "eth1"),
+				gatewayPeer("peer-gw-onlink", "ipv4"),
+			},
+			err: nil,
+		},
+		{
+			name: "unnumbered peer derives interface from a route over an operationally unknown device",
+			routes: []*tables.Route{
+				defaultRouteEntry("169.254.100.0", 125, 100),
+			},
+			peers:         []v2.CiliumBGPNodePeer{unnumberedGatewayPeer("peer-unnum-unknown", "ipv4")},
+			expectedPeers: []v2.CiliumBGPNodePeer{withPeerInterface(unnumberedGatewayPeer("peer-unnum-unknown", "ipv4"), "eth2")},
+			err:           nil,
+		},
+		{
+			// Neither an operationally down nor an administratively down device can
+			// carry the session, so the peer is left unconfigured rather than pinned
+			// to a dead link. Reconciliation does not fail.
+			name: "unnumbered peer is not configured when the default route egresses a down device",
+			routes: []*tables.Route{
+				defaultRouteEntry("192.168.0.5", 126, 100),
+				defaultRouteEntry("192.168.0.6", 127, 200),
+			},
+			peers:         []v2.CiliumBGPNodePeer{unnumberedGatewayPeer("peer-unnum-down", "ipv4")},
+			expectedPeers: []v2.CiliumBGPNodePeer{unnumberedGatewayPeer("peer-unnum-down", "ipv4")},
+			err:           nil,
+		},
+		{
+			name:          "unnumbered peer is not configured without a default route of the requested family",
+			routes:        []*tables.Route{},
+			peers:         []v2.CiliumBGPNodePeer{unnumberedGatewayPeer("peer-unnum-noroute", "ipv6")},
+			expectedPeers: []v2.CiliumBGPNodePeer{unnumberedGatewayPeer("peer-unnum-noroute", "ipv6")},
+			err:           nil,
+		},
+		{
+			// Rejected by the CRD validation rules, but the reconciler must not act on
+			// it either.
+			name:   "unnumbered peer without unnumbered or defaultGateway is not configured",
+			routes: defaultRouteTable,
+			peers: []v2.CiliumBGPNodePeer{
+				{
+					Name:          "peer-unnum-empty",
+					AutoDiscovery: &v2.BGPAutoDiscovery{Mode: v2.BGPUnnumberedMode},
+					PeerASN:       ptr.To[int64](64124),
+				},
+			},
+			expectedPeers: []v2.CiliumBGPNodePeer{
+				{
+					Name:          "peer-unnum-empty",
+					AutoDiscovery: &v2.BGPAutoDiscovery{Mode: v2.BGPUnnumberedMode},
+					PeerASN:       ptr.To[int64](64124),
+				},
+			},
+			err: nil,
+		},
+		{
+			// The default route with the lowest metric wins, and the derived interface
+			// follows it when the metrics change.
+			name:          "unnumbered peer follows the lowest metric default route",
+			routes:        defaultRouteTable,
+			peers:         []v2.CiliumBGPNodePeer{unnumberedGatewayPeer("peer-unnum-metric", "ipv4")},
+			expectedPeers: []v2.CiliumBGPNodePeer{withPeerInterface(unnumberedGatewayPeer("peer-unnum-metric", "ipv4"), "eth0")},
+			newRoutes: []*tables.Route{
+				defaultRouteEntry("192.168.0.3", 123, 300),
+				defaultRouteEntry("192.168.0.4", 124, 200),
+			},
+			newPeers:         []v2.CiliumBGPNodePeer{unnumberedGatewayPeer("peer-unnum-metric", "ipv4")},
+			expectedNewPeers: []v2.CiliumBGPNodePeer{withPeerInterface(unnumberedGatewayPeer("peer-unnum-metric", "ipv4"), "eth1")},
+			err:              nil,
+		},
+		{
 			name:   "update priority of default route",
 			routes: defaultRouteTable,
 			peers: []v2.CiliumBGPNodePeer{
@@ -426,6 +547,49 @@ func TestDefaultGatewayReconciler_Reconcile(t *testing.T) {
 			},
 			err: nil,
 		},
+		{
+			// The same table and type filter guards the unnumbered path. The decoys
+			// egress a different device than the real route and carry the better
+			// metric, so eth0 can only be derived if the filter, and not the ordering
+			// by metric, is what picks the route.
+			name: "unnumbered peer ignores default routes outside the main table",
+			routes: []*tables.Route{
+				{
+					// local table: a metric-0 "local default" over the wrong device
+					Table:     2004,
+					Type:      tables.RTN_LOCAL,
+					Scope:     tables.RT_SCOPE_HOST,
+					Dst:       ipv4Default,
+					Gw:        netip.MustParseAddr("192.168.0.9"),
+					LinkIndex: 124,
+					Priority:  0,
+				},
+				{
+					// Cilium's own table: a default route by way of cilium_host
+					Table:     2005,
+					Type:      tables.RTN_UNICAST,
+					Dst:       ipv4Default,
+					Gw:        netip.MustParseAddr("10.0.5.160"),
+					LinkIndex: 124,
+					Priority:  0,
+				},
+				defaultRouteEntry("192.168.0.3", 123, 1024),
+			},
+			peers:         []v2.CiliumBGPNodePeer{unnumberedGatewayPeer("peer-unnum-tables", "ipv4")},
+			expectedPeers: []v2.CiliumBGPNodePeer{withPeerInterface(unnumberedGatewayPeer("peer-unnum-tables", "ipv4"), "eth0")},
+			err:           nil,
+		},
+		{
+			// The loopback is never the way to a peer, whatever the metric says.
+			name: "unnumbered peer ignores a default route over the loopback",
+			routes: []*tables.Route{
+				onlinkDefaultRouteEntry("0.0.0.0/0", 128, 0),
+				defaultRouteEntry("169.254.100.0", 124, 1024),
+			},
+			peers:         []v2.CiliumBGPNodePeer{unnumberedGatewayPeer("peer-unnum-lo", "ipv4")},
+			expectedPeers: []v2.CiliumBGPNodePeer{withPeerInterface(unnumberedGatewayPeer("peer-unnum-lo", "ipv4"), "eth1")},
+			err:           nil,
+		},
 	}
 
 	for _, tt := range table {
@@ -526,17 +690,15 @@ func TestDefaultGatewayReconciler_Reconcile(t *testing.T) {
 }
 
 // TestDefaultGatewayReconciler_DiscoveryFailureReporting covers the bookkeeping behind the
-// warn-once logging of an unnumbered peer whose address cannot be discovered: the peer is
-// remembered until it either recovers or its instance goes away.
+// warn-once logging of an unnumbered peer that cannot be discovered: the peer is remembered
+// until it either recovers or its instance goes away.
 func TestDefaultGatewayReconciler_DiscoveryFailureReporting(t *testing.T) {
 	req := require.New(t)
 
 	testInstance := &instance.BGPInstance{Name: "test-instance"}
 
-	setTables := func(r *DefaultGatewayReconciler, neighbors []*tables.Neighbor) {
-		db, err := setupStateDBWithNeighbors([]*tables.Route{
-			defaultRouteEntry("192.168.0.3", 123, 100),
-		}, neighbors)
+	setTables := func(r *DefaultGatewayReconciler, routes []*tables.Route) {
+		db, err := setupStateDB(routes)
 		req.NoError(err)
 		txn := db.ReadTxn()
 		r.DB = db
@@ -548,7 +710,7 @@ func TestDefaultGatewayReconciler_DiscoveryFailureReporting(t *testing.T) {
 	reconcile := func(r *DefaultGatewayReconciler) *v2.CiliumBGPNodeInstance {
 		config := &v2.CiliumBGPNodeInstance{
 			Name:  testInstance.Name,
-			Peers: []v2.CiliumBGPNodePeer{unnumberedPeer("peer-unnum", "eth0")},
+			Peers: []v2.CiliumBGPNodePeer{unnumberedGatewayPeer("peer-unnum", "ipv4")},
 		}
 		req.NoError(r.Reconcile(context.Background(), ReconcileParams{
 			BGPInstance:   testInstance,
@@ -560,27 +722,27 @@ func TestDefaultGatewayReconciler_DiscoveryFailureReporting(t *testing.T) {
 
 	reconciler := &DefaultGatewayReconciler{logger: hivetest.Logger(t)}
 
-	// No neighbor on eth0 yet, so the peer's address cannot be discovered. Its
-	// interface is set regardless, so the RAs that populate the entry are sent.
+	// No default route yet, so the peer's interface cannot be derived.
 	setTables(reconciler, nil)
 	config := reconcile(reconciler)
-	req.Equal("eth0", ptr.Deref(config.Peers[0].PeerInterface, ""))
-	req.Nil(config.Peers[0].PeerAddress)
+	req.Nil(config.Peers[0].PeerInterface)
 	req.Contains(reconciler.discoveryFailed, "test-instance/peer-unnum")
 
 	// The failure is tracked once, however many rounds it persists for.
 	reconcile(reconciler)
 	req.Len(reconciler.discoveryFailed, 1)
 
-	// The neighbor appears: the peer is configured and no longer tracked.
-	setTables(reconciler, []*tables.Neighbor{peerNeighbor("fe80::1", 123)})
+	// The default route appears: the peer is configured and no longer tracked.
+	setTables(reconciler, []*tables.Route{
+		defaultRouteEntry("192.168.0.3", 123, 100),
+	})
 	config = reconcile(reconciler)
 	req.Equal("eth0", ptr.Deref(config.Peers[0].PeerInterface, ""))
 	req.Equal("fe80::1%eth0", ptr.Deref(config.Peers[0].PeerAddress, ""))
 	req.Empty(reconciler.discoveryFailed)
 
-	// The neighbor goes away again, and this time the instance is deleted while
-	// the peer is failing.
+	// The route goes away again, and this time the instance is deleted while the
+	// peer is failing.
 	setTables(reconciler, nil)
 	reconcile(reconciler)
 	req.Len(reconciler.discoveryFailed, 1)
@@ -591,7 +753,7 @@ func TestDefaultGatewayReconciler_DiscoveryFailureReporting(t *testing.T) {
 
 	// A peer that leaves the configuration stops being watched, so its link no
 	// longer signals a reconciliation on every neighbor change.
-	setTables(reconciler, []*tables.Neighbor{peerNeighbor("fe80::1", 123)})
+	setTables(reconciler, []*tables.Route{defaultRouteEntry("192.168.0.3", 123, 100)})
 	reconcile(reconciler)
 	req.Len(reconciler.unnumberedLinks, 1)
 	req.NoError(reconciler.Reconcile(context.Background(), ReconcileParams{
@@ -607,7 +769,7 @@ func TestDefaultGatewayReconciler_DiscoveryFailureReporting(t *testing.T) {
 // TestDefaultGatewayReconciler_UnnumberedPeerAddress covers picking the unnumbered peer's
 // address out of the node's neighbor entries on the peering interface.
 func TestDefaultGatewayReconciler_UnnumberedPeerAddress(t *testing.T) {
-	// The index of eth0, the peering interface.
+	// eth0, the interface the ipv4 default route below egresses.
 	const linkIndex = 123
 
 	failedNeighbor := peerNeighbor("fe80::dead", linkIndex)
@@ -681,7 +843,9 @@ func TestDefaultGatewayReconciler_UnnumberedPeerAddress(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			req := require.New(t)
 
-			db, err := setupStateDBWithNeighbors(nil, tt.neighbors)
+			db, err := setupStateDBWithNeighbors([]*tables.Route{
+				defaultRouteEntry("192.168.0.3", linkIndex, 100),
+			}, tt.neighbors)
 			req.NoError(err)
 
 			txn := db.ReadTxn()
@@ -697,7 +861,7 @@ func TestDefaultGatewayReconciler_UnnumberedPeerAddress(t *testing.T) {
 
 			config := &v2.CiliumBGPNodeInstance{
 				Name:  "test-instance",
-				Peers: []v2.CiliumBGPNodePeer{unnumberedPeer("peer-unnum", "eth0")},
+				Peers: []v2.CiliumBGPNodePeer{unnumberedGatewayPeer("peer-unnum", "ipv4")},
 			}
 			req.NoError(reconciler.Reconcile(context.Background(), ReconcileParams{
 				BGPInstance:   &instance.BGPInstance{Name: "test-instance"},
@@ -705,9 +869,9 @@ func TestDefaultGatewayReconciler_UnnumberedPeerAddress(t *testing.T) {
 				CiliumNode:    &v2.CiliumNode{ObjectMeta: metav1.ObjectMeta{Name: "bgp-node"}},
 			}))
 
-			// The interface is set either way: the Router Advertisements the peer
-			// learns this node's own address from depend on it, and they are what
-			// eventually populates the neighbor entry looked for here.
+			// The interface is derived either way: the Router Advertisements the
+			// peer learns this node's own address from depend on it, and they are
+			// what eventually populates the neighbor entry looked for here.
 			req.Equal("eth0", ptr.Deref(config.Peers[0].PeerInterface, ""))
 			// And the link is watched either way, so the neighbor appearing later
 			// triggers another round.
@@ -974,16 +1138,51 @@ func defaultRouteEntry(gw string, linkIndex, priority int) *tables.Route {
 	}
 }
 
-// unnumberedPeer builds an unnumbered peer peering over the named interface.
-func unnumberedPeer(name, iface string) v2.CiliumBGPNodePeer {
+// onlinkDefaultRouteEntry builds a main-table unicast on-link default route ("default dev
+// eth1"). With no gateway there is no address to take the family from, so dst is explicit.
+func onlinkDefaultRouteEntry(dst string, linkIndex, priority int) *tables.Route {
+	return &tables.Route{
+		Table:     tables.RT_TABLE_MAIN,
+		Type:      tables.RTN_UNICAST,
+		Dst:       netip.MustParsePrefix(dst),
+		LinkIndex: linkIndex,
+		Priority:  priority,
+	}
+}
+
+// unnumberedGatewayPeer builds an unnumbered peer whose interface is to be derived from the
+// default route of the given address family.
+func unnumberedGatewayPeer(name, addressFamily string) v2.CiliumBGPNodePeer {
 	return v2.CiliumBGPNodePeer{
 		Name: name,
 		AutoDiscovery: &v2.BGPAutoDiscovery{
-			Mode:       v2.BGPUnnumberedMode,
-			Unnumbered: &v2.BGPUnnumbered{Interface: iface},
+			Mode:           v2.BGPUnnumberedMode,
+			DefaultGateway: &v2.DefaultGateway{AddressFamily: addressFamily},
 		},
 		PeerASN: ptr.To[int64](64124),
 	}
+}
+
+// gatewayPeer builds a peer whose address is to be discovered from the default route of the
+// given address family.
+func gatewayPeer(name, addressFamily string) v2.CiliumBGPNodePeer {
+	return v2.CiliumBGPNodePeer{
+		Name: name,
+		AutoDiscovery: &v2.BGPAutoDiscovery{
+			Mode:           v2.BGPDefaultGatewayMode,
+			DefaultGateway: &v2.DefaultGateway{AddressFamily: addressFamily},
+		},
+		PeerASN: ptr.To[int64](64124),
+	}
+}
+
+// withPeerInterface returns the peer with the interface and the peer address on it that
+// the reconciler is expected to have discovered for it. setupStateDB puts the same peer
+// link-local address on every link, so only the zone tells them apart.
+func withPeerInterface(peer v2.CiliumBGPNodePeer, iface string) v2.CiliumBGPNodePeer {
+	peer.PeerInterface = ptr.To(iface)
+	peer.PeerAddress = ptr.To("fe80::1%" + iface)
+	return peer
 }
 
 // peerNeighbor builds the neighbor table entry an unnumbered peer is discovered from: a

@@ -293,8 +293,10 @@ require (
 replace sigs.k8s.io/controller-tools => github.com/cilium/controller-tools v0.16.5-1
 
 // Using private fork of gobgp. See commit msg for more context as to why we
-// are using a private fork.
-replace github.com/osrg/gobgp/v3 => github.com/cilium/gobgp/v3 v3.0.0-20260130142103-27e5da2a39e6
+// are using a private fork. Temporarily pointed at ecbaldwin/gobgp, which is
+// cilium/gobgp@27e5da2a (branch v3.37.0-with-fix) plus two unnumbered-peer
+// fixes; to be folded back into cilium/gobgp.
+replace github.com/osrg/gobgp/v3 => github.com/ecbaldwin/gobgp/v3 v3.0.0-20260731173315-54f914f3f977
 
 tool (
 	github.com/cilium/deepequal-gen

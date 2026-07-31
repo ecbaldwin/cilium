@@ -1695,7 +1695,18 @@ func (s *BgpServer) handleFSMMessage(peer *peer, e *fsmMsg) {
 			ipaddr, _ := net.ResolveIPAddr("ip", laddr)
 			peer.fsm.peerInfo.LocalAddress = ipaddr.IP
 			if peer.fsm.pConf.Transport.Config.LocalAddress != netip.IPv4Unspecified().String() && peer.fsm.pConf.Transport.Config.LocalAddress != netip.IPv6Unspecified().String() {
-				peer.fsm.peerInfo.LocalAddress = net.ParseIP(peer.fsm.pConf.Transport.Config.LocalAddress)
+				// Zone-tolerant parse: an unnumbered peer's configured local
+				// address always carries a zone (getIPv6LinkLocalAddress renders
+				// "fe80::1%eth0"), and net.ParseIP rejects zones and returns nil.
+				// A nil LocalAddress silently disables the export-side nexthop
+				// rewrite (see policy.go, which only rewrites when it is non-nil),
+				// so locally-originated paths go out with an unspecified nexthop
+				// (:: / 0.0.0.0) and the peer discards them. Mirrors the "exclude
+				// zone info" handling two lines above. gobgp v4 does the equivalent
+				// with LocalAddress.WithZone("").
+				if localAddr, err := net.ResolveIPAddr("ip", peer.fsm.pConf.Transport.Config.LocalAddress); err == nil {
+					peer.fsm.peerInfo.LocalAddress = localAddr.IP
+				}
 				peer.fsm.pConf.Transport.State.LocalAddress = peer.fsm.pConf.Transport.Config.LocalAddress
 			}
 			neighborAddress := peer.fsm.pConf.State.NeighborAddress
@@ -3229,15 +3240,14 @@ func (s *BgpServer) addPeerGroup(c *oc.PeerGroup) error {
 }
 
 func (s *BgpServer) addNeighbor(c *oc.Neighbor) error {
-	addr, err := c.ExtractNeighborAddress()
-	if err != nil {
-		return err
-	}
-
-	if _, y := s.neighborMap[addr]; y {
-		return fmt.Errorf("can't overwrite the existing peer: %s", addr)
-	}
-
+	// Resolve config defaults BEFORE extracting/validating the neighbor address.
+	// For an unnumbered (interface-only) neighbor added via the gRPC AddPeer API
+	// - NeighborInterface set, NeighborAddress empty - SetDefaultNeighborConfigValues
+	// resolves the peer's IPv6 link-local from the interface into
+	// State.NeighborAddress and derives the local link-local as the transport
+	// source address. ExtractNeighborAddress would otherwise reject the addressless
+	// neighbor up front with "NeighborAddress is not configured". The config-file
+	// path already defaults before addNeighbor; this makes the gRPC path match.
 	var pgConf *oc.PeerGroup
 	if c.Config.PeerGroup != "" {
 		pg, ok := s.peerGroupMap[c.Config.PeerGroup]
@@ -3249,6 +3259,15 @@ func (s *BgpServer) addNeighbor(c *oc.Neighbor) error {
 
 	if err := oc.SetDefaultNeighborConfigValues(c, pgConf, &s.bgpConfig.Global); err != nil {
 		return err
+	}
+
+	addr, err := c.ExtractNeighborAddress()
+	if err != nil {
+		return err
+	}
+
+	if _, y := s.neighborMap[addr]; y {
+		return fmt.Errorf("can't overwrite the existing peer: %s", addr)
 	}
 
 	if vrf := c.Config.Vrf; vrf != "" {

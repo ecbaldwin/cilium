@@ -844,6 +844,7 @@ uint
 unapplied
 unaudited
 uncommented
+unconfigured
 uncordon
 unencrypted
 unexported

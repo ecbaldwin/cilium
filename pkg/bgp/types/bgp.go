@@ -67,8 +67,15 @@ type Path struct {
 // of GoBGP's Peer object, but only contains minimal fields required for Cilium
 // usecases.
 type Neighbor struct {
-	Name            string
-	Address         netip.Addr
+	Name string
+	// Address is the peer address. For BGP unnumbered (interface-only peering)
+	// it is left zero and Interface is set instead.
+	Address netip.Addr
+	// Interface is the local interface for BGP unnumbered peering. It is
+	// mutually exclusive with Address: gobgp discovers the peer's link-local
+	// via IPv6 ND on this interface, and setting both is not supported (gobgp
+	// overwrites the address with the discovered one).
+	Interface       string
 	ASN             uint32
 	AuthPassword    string
 	EbgpMultihop    *NeighborEbgpMultihop
@@ -144,8 +151,15 @@ type PeerState struct {
 	// Name of the peer
 	Name string
 
-	// Address of the peer
+	// Address of the peer. For unnumbered peers this is the peer's IPv6
+	// link-local address discovered by the router on Interface, carrying the
+	// interface as an IPv6 zone (e.g. "fe80::1%eth0"). It is invalid if the
+	// router has not resolved the peer yet.
 	Address netip.Addr
+
+	// Interface is the local interface of an unnumbered peer. Empty for peers
+	// configured with an explicit address.
+	Interface string
 
 	// BGP peer state
 	SessionState SessionState

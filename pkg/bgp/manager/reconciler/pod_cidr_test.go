@@ -99,6 +99,75 @@ var (
 		},
 	}
 
+	// unnumberedPeer65001 peers over an interface only, its address is whatever
+	// the router resolved via IPv6 ND.
+	unnumberedPeer65001 = v2.CiliumBGPNodePeer{
+		Name:          "red-peer-65001",
+		PeerInterface: ptr.To[string]("eth0"),
+		PeerConfigRef: &v2.PeerConfigReference{
+			Name: "peer-config-red",
+		},
+	}
+	unnumberedPeer65001Address = netip.MustParseAddr("fe80::1%eth0")
+
+	unnumberedPeer65001v4PodCIDRRoutePolicy = &types.RoutePolicy{
+		Name: "red-peer-65001-ipv4-PodCIDR",
+		Type: types.RoutePolicyTypeExport,
+		Statements: []*types.RoutePolicyStatement{
+			{
+				Conditions: types.RoutePolicyConditions{
+					MatchNeighbors: &types.RoutePolicyNeighborMatch{
+						Type:      types.RoutePolicyMatchAny,
+						Neighbors: []netip.Addr{unnumberedPeer65001Address},
+					},
+					MatchPrefixes: &types.RoutePolicyPrefixMatch{
+						Type: types.RoutePolicyMatchAny,
+						Prefixes: []types.RoutePolicyPrefix{
+							{
+								CIDR:         netip.MustParsePrefix(podCIDR1v4),
+								PrefixLenMin: netip.MustParsePrefix(podCIDR1v4).Bits(),
+								PrefixLenMax: netip.MustParsePrefix(podCIDR1v4).Bits(),
+							},
+						},
+					},
+				},
+				Actions: types.RoutePolicyActions{
+					RouteAction:    types.RoutePolicyActionAccept,
+					AddCommunities: []string{"65000:100"},
+				},
+			},
+		},
+	}
+
+	unnumberedPeer65001v6PodCIDRRoutePolicy = &types.RoutePolicy{
+		Name: "red-peer-65001-ipv6-PodCIDR",
+		Type: types.RoutePolicyTypeExport,
+		Statements: []*types.RoutePolicyStatement{
+			{
+				Conditions: types.RoutePolicyConditions{
+					MatchNeighbors: &types.RoutePolicyNeighborMatch{
+						Type:      types.RoutePolicyMatchAny,
+						Neighbors: []netip.Addr{unnumberedPeer65001Address},
+					},
+					MatchPrefixes: &types.RoutePolicyPrefixMatch{
+						Type: types.RoutePolicyMatchAny,
+						Prefixes: []types.RoutePolicyPrefix{
+							{
+								CIDR:         netip.MustParsePrefix(podCIDR1v6),
+								PrefixLenMin: netip.MustParsePrefix(podCIDR1v6).Bits(),
+								PrefixLenMax: netip.MustParsePrefix(podCIDR1v6).Bits(),
+							},
+						},
+					},
+				},
+				Actions: types.RoutePolicyActions{
+					RouteAction:    types.RoutePolicyActionAccept,
+					AddCommunities: []string{"65000:100"},
+				},
+			},
+		},
+	}
+
 	bluePeer65001v4PodCIDRRoutePolicy = &types.RoutePolicy{
 		Name: "blue-peer-65001-ipv4-PodCIDR",
 		Type: types.RoutePolicyTypeExport,
@@ -179,6 +248,7 @@ func Test_PodCIDRAdvertisement(t *testing.T) {
 		preconfiguredRPs      RoutePolicyMap
 		testCiliumNode        *v2.CiliumNode
 		testBGPInstanceConfig *v2.CiliumBGPNodeInstance
+		resolvedPeers         map[string]netip.Addr
 		expectedPaths         map[types.Family]map[string]struct{}
 		expectedRPs           RoutePolicyMap
 	}{
@@ -281,6 +351,86 @@ func Test_PodCIDRAdvertisement(t *testing.T) {
 				bluePeer65001v4PodCIDRRoutePolicy.Name: bluePeer65001v4PodCIDRRoutePolicy,
 				bluePeer65001v6PodCIDRRoutePolicy.Name: bluePeer65001v6PodCIDRRoutePolicy,
 			},
+		},
+		{
+			name: "pod cidr advertisement to an unnumbered peer resolved by the router",
+			peerConfig: []*v2.CiliumBGPPeerConfig{
+				redPeerConfig,
+			},
+			advertisements: []*v2.CiliumBGPAdvertisement{
+				redAdvert,
+			},
+			preconfiguredPaths: map[types.Family]map[string]struct{}{},
+			testCiliumNode: &v2.CiliumNode{
+				ObjectMeta: meta_v1.ObjectMeta{
+					Name: "Test Node",
+				},
+				Spec: v2.NodeSpec{
+					IPAM: ipamtypes.IPAMSpec{
+						PodCIDRs: []string{podCIDR1v4, podCIDR1v6},
+					},
+				},
+			},
+			testBGPInstanceConfig: &v2.CiliumBGPNodeInstance{
+				Name:     "bgp-65001",
+				LocalASN: ptr.To[int64](65001),
+				Peers: []v2.CiliumBGPNodePeer{
+					unnumberedPeer65001,
+				},
+			},
+			resolvedPeers: map[string]netip.Addr{
+				unnumberedPeer65001.Name: unnumberedPeer65001Address,
+			},
+			expectedPaths: map[types.Family]map[string]struct{}{
+				{Afi: types.AfiIPv4, Safi: types.SafiUnicast}: {
+					podCIDR1v4: struct{}{},
+				},
+				{Afi: types.AfiIPv6, Safi: types.SafiUnicast}: {
+					podCIDR1v6: struct{}{},
+				},
+			},
+			expectedRPs: map[string]*types.RoutePolicy{
+				unnumberedPeer65001v4PodCIDRRoutePolicy.Name: unnumberedPeer65001v4PodCIDRRoutePolicy,
+				unnumberedPeer65001v6PodCIDRRoutePolicy.Name: unnumberedPeer65001v6PodCIDRRoutePolicy,
+			},
+		},
+		{
+			// The paths are still advertised into the local RIB, only the export
+			// policies wait for the peer address.
+			name: "pod cidr advertisement to an unnumbered peer not resolved yet",
+			peerConfig: []*v2.CiliumBGPPeerConfig{
+				redPeerConfig,
+			},
+			advertisements: []*v2.CiliumBGPAdvertisement{
+				redAdvert,
+			},
+			preconfiguredPaths: map[types.Family]map[string]struct{}{},
+			testCiliumNode: &v2.CiliumNode{
+				ObjectMeta: meta_v1.ObjectMeta{
+					Name: "Test Node",
+				},
+				Spec: v2.NodeSpec{
+					IPAM: ipamtypes.IPAMSpec{
+						PodCIDRs: []string{podCIDR1v4, podCIDR1v6},
+					},
+				},
+			},
+			testBGPInstanceConfig: &v2.CiliumBGPNodeInstance{
+				Name:     "bgp-65001",
+				LocalASN: ptr.To[int64](65001),
+				Peers: []v2.CiliumBGPNodePeer{
+					unnumberedPeer65001,
+				},
+			},
+			expectedPaths: map[types.Family]map[string]struct{}{
+				{Afi: types.AfiIPv4, Safi: types.SafiUnicast}: {
+					podCIDR1v4: struct{}{},
+				},
+				{Afi: types.AfiIPv6, Safi: types.SafiUnicast}: {
+					podCIDR1v6: struct{}{},
+				},
+			},
+			expectedRPs: map[string]*types.RoutePolicy{},
 		},
 		{
 			name: "pod cidr advertisement - cleanup old pod cidr",
@@ -474,9 +624,10 @@ func Test_PodCIDRAdvertisement(t *testing.T) {
 			// run reconciler twice to ensure idempotency
 			for range 2 {
 				err := podCIDRReconciler.Reconcile(context.Background(), ReconcileParams{
-					BGPInstance:   testBGPInstance,
-					DesiredConfig: tt.testBGPInstanceConfig,
-					CiliumNode:    tt.testCiliumNode,
+					BGPInstance:           testBGPInstance,
+					DesiredConfig:         tt.testBGPInstanceConfig,
+					CiliumNode:            tt.testCiliumNode,
+					ResolvedPeerAddresses: tt.resolvedPeers,
 				})
 				req.NoError(err)
 			}

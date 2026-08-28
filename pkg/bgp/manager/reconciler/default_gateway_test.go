@@ -265,6 +265,61 @@ func TestDefaultGatewayReconciler_Reconcile(t *testing.T) {
 			err: nil,
 		},
 		{
+			// A real default route in the main table is not beaten by a route in
+			// another table, however good the other one's metric. The main-table route
+			// deliberately carries the worse metric here, so what decides the outcome
+			// is the filter and not the ordering by metric.
+			name: "prefers the main-table default route over one in another table",
+			routes: []*tables.Route{
+				{
+					// local table: a metric-0 "local default" over the wrong device
+					Table:     2004,
+					Type:      tables.RTN_LOCAL,
+					Scope:     tables.RT_SCOPE_HOST,
+					Dst:       ipv4Default,
+					Gw:        netip.MustParseAddr("192.168.0.9"),
+					LinkIndex: 123,
+					Priority:  0,
+				},
+				{
+					// Cilium's own table: a default route by way of cilium_host
+					Table:     2005,
+					Type:      tables.RTN_UNICAST,
+					Dst:       ipv4Default,
+					Gw:        netip.MustParseAddr("10.0.5.160"),
+					LinkIndex: 124,
+					Priority:  0,
+				},
+				defaultRouteEntry("192.168.0.3", 123, 1024),
+			},
+			peers: []v2.CiliumBGPNodePeer{
+				{
+					Name: "peer-tables-pref",
+					AutoDiscovery: &v2.BGPAutoDiscovery{
+						Mode: v2.BGPDefaultGatewayMode,
+						DefaultGateway: &v2.DefaultGateway{
+							AddressFamily: "ipv4",
+						},
+					},
+					PeerASN: ptr.To[int64](64124),
+				},
+			},
+			expectedPeers: []v2.CiliumBGPNodePeer{
+				{
+					Name:        "peer-tables-pref",
+					PeerAddress: ptr.To[string]("192.168.0.3"),
+					AutoDiscovery: &v2.BGPAutoDiscovery{
+						Mode: v2.BGPDefaultGatewayMode,
+						DefaultGateway: &v2.DefaultGateway{
+							AddressFamily: "ipv4",
+						},
+					},
+					PeerASN: ptr.To[int64](64124),
+				},
+			},
+			err: nil,
+		},
+		{
 			// A node runs default routes in tables other than main - Cilium installs one
 			// by way of cilium_host, and a local table holds a metric-0 "default dev lo".
 			// Neither is the way off the node, so with no main-table unicast default

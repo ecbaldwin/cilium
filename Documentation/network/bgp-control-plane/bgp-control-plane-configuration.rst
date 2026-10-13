@@ -187,9 +187,18 @@ addressing other than link-local ones.
 
 The peer's address is taken from the node's neighbor cache, which Cilium tracks, so the
 session is established as soon as the peer is discovered there and moved if the peer ever
-comes back at a different link-local address. The link has to be point-to-point: if more
-than one candidate neighbor is discovered on the interface, there is no way to tell which
-one the session is meant for and the peer is not configured.
+comes back at a different link-local address. Only IPv6 link-local neighbors are considered;
+failed neighbor entries and the interface's own addresses are excluded. Cilium prefers
+neighbors marked as routers in the neighbor cache, as learned through Router Advertisements.
+If any router neighbors are present, only those neighbors are considered as candidates;
+otherwise, Cilium considers all eligible neighbors on the interface. This fallback allows
+discovery of a peer that does not send Router Advertisements.
+
+The link has to be point-to-point: after applying this preference, exactly one candidate
+must remain. If no candidate or multiple candidates remain, the peer is not configured.
+For example, one router neighbor and one non-router neighbor select the router, while two
+router neighbors are ambiguous and prevent peering. Cilium retries discovery when the
+neighbor cache changes.
 
 .. code-block:: yaml
 

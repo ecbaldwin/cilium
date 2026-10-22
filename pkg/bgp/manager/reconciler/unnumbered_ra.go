@@ -75,6 +75,7 @@ type UnnumberedRAReconciler struct {
 	senders map[string]*raSender
 	// baseCtx is the parent context for RA sender goroutines (agent lifetime).
 	baseCtx context.Context
+	cancel  context.CancelFunc
 	// newSender constructs the RA sender for an interface. It is a field so
 	// tests can substitute a stub that does not open a raw ICMPv6 socket;
 	// production wiring points it at newRASender.
@@ -91,17 +92,33 @@ type UnnumberedRAReconcilerOut struct {
 	Reconciler ConfigReconciler `group:"bgp-config-reconciler"`
 }
 
-func NewUnnumberedRAReconciler(logger *slog.Logger) UnnumberedRAReconcilerOut {
-	return UnnumberedRAReconcilerOut{
-		Reconciler: &UnnumberedRAReconciler{
-			logger:     logger.With(types.ReconcilerLogField, UnnumberedRAReconcilerName),
-			byInstance: make(map[string]map[string]struct{}),
-			senders:    make(map[string]*raSender),
-			baseCtx:    context.Background(),
-			newSender:  newRASender,
-			ifIndexOf:  interfaceIndex,
-		},
+func NewUnnumberedRAReconciler(logger *slog.Logger, lc cell.Lifecycle) UnnumberedRAReconcilerOut {
+	ctx, cancel := context.WithCancel(context.Background())
+	r := &UnnumberedRAReconciler{
+		logger:     logger.With(types.ReconcilerLogField, UnnumberedRAReconcilerName),
+		byInstance: make(map[string]map[string]struct{}),
+		senders:    make(map[string]*raSender),
+		baseCtx:    ctx,
+		cancel:     cancel,
+		newSender:  newRASender,
+		ifIndexOf:  interfaceIndex,
 	}
+	lc.Append(cell.Hook{OnStop: r.stop})
+	return UnnumberedRAReconcilerOut{Reconciler: r}
+}
+
+// stop cancels all senders and waits for their sockets and reader goroutines
+// to close before Hive shutdown completes.
+func (r *UnnumberedRAReconciler) stop(cell.HookContext) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.cancel()
+	for ifname, s := range r.senders {
+		s.stop()
+		delete(r.senders, ifname)
+	}
+	clear(r.byInstance)
+	return nil
 }
 
 // interfaceByName returns the named interface as a *net.Interface, which is
@@ -180,6 +197,10 @@ func (r *UnnumberedRAReconciler) Reconcile(_ context.Context, p ReconcileParams)
 // reconcileSendersLocked starts/stops RA senders so the running set equals the
 // union of unnumbered interfaces across all instances. Caller must hold r.mu.
 func (r *UnnumberedRAReconciler) reconcileSendersLocked() {
+	if r.baseCtx.Err() != nil {
+		return
+	}
+
 	want := make(map[string]struct{})
 	for _, ifs := range r.byInstance {
 		for ifname := range ifs {

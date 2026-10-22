@@ -10,11 +10,13 @@ import (
 	"sort"
 	"testing"
 
+	"github.com/cilium/hive/cell"
 	"github.com/cilium/hive/hivetest"
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/cilium/cilium/pkg/bgp/manager/instance"
+	"github.com/cilium/cilium/pkg/hive"
 	v2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 )
 
@@ -95,14 +97,18 @@ func (f *fakeSenderFactory) make(parent context.Context, _ *slog.Logger, ifname 
 }
 
 func newTestRAReconciler(t *testing.T, factory *fakeSenderFactory) *UnnumberedRAReconciler {
-	return &UnnumberedRAReconciler{
+	ctx, cancel := context.WithCancel(context.Background())
+	r := &UnnumberedRAReconciler{
 		logger:     hivetest.Logger(t),
 		byInstance: make(map[string]map[string]struct{}),
 		senders:    make(map[string]*raSender),
-		baseCtx:    context.Background(),
+		baseCtx:    ctx,
+		cancel:     cancel,
 		newSender:  factory.make,
 		ifIndexOf:  factory.links.indexOf,
 	}
+	t.Cleanup(func() { require.NoError(t, r.stop(context.Background())) })
+	return r
 }
 
 // raParams builds ReconcileParams for an instance whose peers request the given
@@ -303,4 +309,38 @@ func TestUnnumberedRAReconciler_StartFailureIsSkippedAndRetried(t *testing.T) {
 	require.NoError(t, r.Reconcile(context.Background(), raParams("instance-1", "net0", "net1")))
 	require.Equal(t, []string{"net0"}, runningIfaces(r))
 	require.GreaterOrEqual(t, factory.created["net0"], 1)
+}
+
+func TestUnnumberedRAReconciler_HiveStop(t *testing.T) {
+	logger := hivetest.Logger(t)
+	factory := newFakeSenderFactory()
+	var r *UnnumberedRAReconciler
+	h := hive.New(cell.Invoke(func(lc cell.Lifecycle) {
+		r = NewUnnumberedRAReconciler(logger, lc).Reconciler.(*UnnumberedRAReconciler)
+		r.newSender = factory.make
+		r.ifIndexOf = factory.links.indexOf
+	}))
+	ctx := context.Background()
+	require.NoError(t, h.Start(logger, ctx))
+	t.Cleanup(func() { require.NoError(t, h.Stop(logger, ctx)) })
+
+	require.NoError(t, r.Reconcile(ctx, raParams("instance-1", "net0")))
+	require.NoError(t, r.Reconcile(ctx, raParams("instance-2", "net0", "net1")))
+	senders := []*raSender{r.senders["net0"], r.senders["net1"]}
+	require.NoError(t, h.Stop(logger, ctx))
+	require.ErrorIs(t, r.baseCtx.Err(), context.Canceled)
+	require.Empty(t, runningIfaces(r))
+	require.Empty(t, r.byInstance)
+	for _, s := range senders {
+		select {
+		case <-s.done:
+		default:
+			t.Fatal("Hive stop returned before an RA sender exited")
+		}
+	}
+
+	// A late reconcile must not open a new socket after shutdown.
+	require.NoError(t, r.Reconcile(ctx, raParams("instance-1", "net0", "net1")))
+	require.Empty(t, runningIfaces(r))
+	require.Equal(t, map[string]int{"net0": 1, "net1": 1}, factory.created)
 }

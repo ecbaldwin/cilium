@@ -307,3 +307,89 @@ func TestUnnumberedReconciler_NeighborChangeTrackerObserver(t *testing.T) {
 		})
 	}
 }
+
+func TestUnnumberedReconciler_AlternativeInterfaceName(t *testing.T) {
+	for _, ifname := range []string{"eth0", "bgp-uplink", "bgp-unnumbered-uplink"} {
+		t.Run(ifname, func(t *testing.T) {
+			req := require.New(t)
+			db, err := setupStateDBWithNeighbors(nil, nil)
+			req.NoError(err)
+			devices := db.GetTable(db.ReadTxn(), "devices").(statedb.RWTable[*tables.Device])
+			neighbors := db.GetTable(db.ReadTxn(), "neighbors").(statedb.RWTable[*tables.Neighbor])
+			txn := db.WriteTxn(devices)
+			dev, _, found := devices.Get(txn, tables.DeviceByName("eth0"))
+			req.True(found)
+			dev = dev.DeepCopy()
+			dev.AltNames = []string{"bgp-uplink", "bgp-unnumbered-uplink"}
+			_, _, err = devices.Insert(txn, dev)
+			req.NoError(err)
+			txn.Commit()
+
+			r := &UnnumberedReconciler{
+				logger: hivetest.Logger(t), DB: db,
+				deviceTable: devices, neighborTable: neighbors,
+			}
+			peer := unnumberedPeer("peer-unnum", ifname)
+			reconcile := func(wantInterface, wantAddress string) {
+				t.Helper()
+				config := &v2.CiliumBGPNodeInstance{Name: "test-instance", Peers: []v2.CiliumBGPNodePeer{peer}}
+				req.NoError(r.Reconcile(context.Background(), ReconcileParams{
+					BGPInstance: &instance.BGPInstance{Name: config.Name}, DesiredConfig: config,
+					CiliumNode: &v2.CiliumNode{ObjectMeta: metav1.ObjectMeta{Name: "bgp-node"}},
+				}))
+				// Resolve RA configuration even before ND has found the peer.
+				req.Equal(wantInterface, config.Peers[0].AutoDiscovery.Unnumbered.Interface)
+				req.Equal(wantAddress, ptr.Deref(config.Peers[0].PeerAddress, ""))
+				req.Equal(map[string]int{"test-instance/peer-unnum": dev.Index}, r.unnumberedLinks)
+				// Desired state must not mutate the shared API configuration.
+				req.Equal(ifname, peer.AutoDiscovery.Unnumbered.Interface)
+			}
+			reconcile("eth0", "")
+
+			txn = db.WriteTxn(neighbors)
+			_, _, err = neighbors.Insert(txn, peerNeighbor("fe80::1", dev.Index))
+			req.NoError(err)
+			txn.Commit()
+			reconcile("eth0", "fe80::1%eth0")
+			address, _, err := r.getUnnumberedPeerAddress(ifname)
+			req.NoError(err)
+			req.Equal("fe80::1%eth0", address)
+
+			if ifname == "eth0" {
+				return
+			}
+			// A primary-name change must be reflected in the zone while the
+			// configured alternate name and device index stay the same.
+			txn = db.WriteTxn(devices)
+			dev = dev.DeepCopy()
+			dev.Name = "renamed0"
+			_, _, err = devices.Insert(txn, dev)
+			req.NoError(err)
+			txn.Commit()
+			reconcile("renamed0", "fe80::1%renamed0")
+		})
+	}
+}
+
+func TestUnnumberedReconciler_AlternativeInterfaceNameZone(t *testing.T) {
+	req := require.New(t)
+	db, err := setupStateDBWithNeighbors(nil, []*tables.Neighbor{peerNeighbor("fe80::1", 123)})
+	req.NoError(err)
+	devices := db.GetTable(db.ReadTxn(), "devices").(statedb.RWTable[*tables.Device])
+	txn := db.WriteTxn(devices)
+	dev, _, found := devices.Get(txn, tables.DeviceByName("eth0"))
+	req.True(found)
+	dev = dev.DeepCopy()
+	dev.AltNames = []string{"bgp-uplink"}
+	_, _, err = devices.Insert(txn, dev)
+	req.NoError(err)
+	txn.Commit()
+	r := &UnnumberedReconciler{
+		DB: db, deviceTable: devices,
+		neighborTable: db.GetTable(db.ReadTxn(), "neighbors").(statedb.Table[*tables.Neighbor]),
+	}
+	address, linkIndex, err := r.getUnnumberedPeerAddress("bgp-uplink")
+	req.NoError(err)
+	req.Equal("fe80::1%eth0", address)
+	req.Equal(123, linkIndex)
+}

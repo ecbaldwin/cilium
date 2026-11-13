@@ -158,6 +158,13 @@ func (r *UnnumberedReconciler) Reconcile(ctx context.Context, p ReconcileParams)
 		// it is reached over an interface at whatever IPv6 link-local address
 		// Neighbor Discovery learned for it.
 		iface := peer.AutoDiscovery.Unnumbered.Interface
+		if dev, _, found := r.deviceTable.Get(r.DB.ReadTxn(), tables.DeviceByName(iface)); found && dev.Name != iface {
+			// Go's IPv6 zone lookup only recognizes primary interface names.
+			iface = dev.Name
+			resolved := peer.AutoDiscovery.DeepCopy()
+			resolved.Unnumbered.Interface = iface
+			p.DesiredConfig.Peers[i].AutoDiscovery = resolved
+		}
 
 		peerAddress, linkIndex, err := r.getUnnumberedPeerAddress(iface)
 		if linkIndex != 0 {
@@ -222,7 +229,7 @@ func (r *UnnumberedReconciler) getUnnumberedPeerAddress(ifname string) (string, 
 	case 0:
 		return "", dev.Index, fmt.Errorf("no IPv6 link-local neighbor discovered on interface %s", ifname)
 	case 1:
-		return candidates[0].WithZone(ifname).String(), dev.Index, nil
+		return candidates[0].WithZone(dev.Name).String(), dev.Index, nil
 	default:
 		// An unnumbered session is point-to-point, so several candidates leave no way to
 		// tell which one the peer is. Guessing would peer with an arbitrary neighbor.

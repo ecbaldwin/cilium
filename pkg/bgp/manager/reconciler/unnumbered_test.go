@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright Authors of Cilium
-// This file was not reviewed by a human before submission
 
 package reconciler
 

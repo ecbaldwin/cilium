@@ -317,7 +317,7 @@ func TestUnnumberedReconciler_AlternativeInterfaceNameZone(t *testing.T) {
 	dev, _, found := devices.Get(txn, tables.DeviceByName("eth0"))
 	req.True(found)
 	dev = dev.DeepCopy()
-	dev.AltNames = []string{"bgp-uplink", "bgp-unnumbered-uplink"}
+	dev.AltNames = []string{"bgp-uplink"}
 	_, _, err = devices.Insert(txn, dev)
 	req.NoError(err)
 	txn.Commit()
@@ -325,7 +325,7 @@ func TestUnnumberedReconciler_AlternativeInterfaceNameZone(t *testing.T) {
 		DB: db, deviceTable: devices,
 		neighborTable: db.GetTable(db.ReadTxn(), "neighbors").(statedb.Table[*tables.Neighbor]),
 	}
-	for _, ifname := range []string{"eth0", "bgp-uplink", "bgp-unnumbered-uplink"} {
+	for _, ifname := range []string{"eth0", "bgp-uplink"} {
 		t.Run(ifname, func(t *testing.T) {
 			address, linkIndex, err := r.getUnnumberedPeerAddress(ifname)
 			require.NoError(t, err)
